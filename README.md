@@ -1,6 +1,6 @@
 # lsp-docker-proxy
 
-[![License](https://img.shields.io/github/license/mashape/apistatus.svg)](https://github.com/Anexen/lsp-docker-proxy/LICENSE)
+[![License](https://img.shields.io/github/license/mashape/apistatus.svg)](https://github.com/Anexen/lsp-docker-proxy/blob/master/LICENSE)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 Proxy for Language Server running inside docker container
@@ -14,7 +14,7 @@ Proxy for Language Server running inside docker container
 Start docker container
 
 ```
-$ docker run -p 9999:9999 -v $(pwd):/app -w /app pyls --tcp --host 0.0.0.0 --port 9999
+$ docker run -p 9999:9999 -v $(pwd):/app <dev-image> pyls --tcp --host 0.0.0.0 --port 9999
 ```
 
 Run proxy
