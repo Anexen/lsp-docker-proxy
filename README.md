@@ -31,7 +31,7 @@ Use proxy address in your editor. Example for Neovim with [LanguageClient-neovim
 
 ```
 let g:LanguageClient_serverCommands = {
-    \ 'python': ['tcp://127.0.0.1:9999'],
+    \ 'python': ['tcp://127.0.0.1:10001'],
     \ 'javascript': ['tcp://127.0.0.1:11011'],
     \ }
 ```
