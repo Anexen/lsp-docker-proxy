@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import os
 import re
+import tempfile
 from pprint import pformat
 
 logger = logging.getLogger(__name__)
@@ -21,109 +23,103 @@ class MessageTypes:
     ERROR = "error"
 
 
-class BaseDispatcher:
-    def __init__(self, path_mapping):
-        self.path_mapping = path_mapping or {}
-        self.reversed_path_mapping = {v: k for k, v in path_mapping.items()}
-
-    async def dispatch(self, payload, direction):
+class BaseRemoteAccessor:
+    def download(self):
         raise NotImplementedError
 
-    def get_message_type(self, payload):
-        if "method" in payload:
-            return (
-                MessageTypes.REQUEST if "id" in payload else MessageTypes.NOTIFICATION
-            )
 
-        if "result" in payload:
-            return MessageTypes.RESPONSE
+class DockerRemoteAccessor(BaseRemoteAccessor):
+    def __init__(self, container_id):
+        self.container_id = container_id
 
-        if "error" in payload:
-            return MessageTypes.ERROR
+    def download(self, path):
+        logger.debug("Downloading %s", path)
+        path = path.replace("file://", "")
+        filename, file_extension = os.path.splitext(path)
+        _, temp = tempfile.mkstemp(suffix=file_extension)
+        os.popen(f"docker cp {self.container_id}:{path} {temp}").read()
+        return "file://" + temp
 
-        raise NotImplementedError("Unknown message type")
 
+class Dispatcher:
+    path_properties = {
+        "newUri",
+        "oldUri",
+        "rootPath",
+        "rootUri",
+        "scopeUri",
+        "targetUri",
+        "uri",
+    }
 
-class NaiveDispatcher(BaseDispatcher):
-    """
-    Performs dumb replace by defined mapping
-    """
+    def __init__(self, path_mapping, direction, remote_accessor=None):
+        self.path_mapping = path_mapping
+        self.direction = direction
+        self.remote_accessor = remote_accessor
+        self.rebuild_regex()
 
-    async def dispatch(self, payload, direction):
-        if direction == Direction.UPSTREAM:
-            mapping = self.path_mapping
-        else:
-            mapping = self.reversed_path_mapping
-
-        return json.loads(self.multiple_replace(mapping, json.dumps(payload)))
-
-    @staticmethod
-    def multiple_replace(adict, text):
+    def rebuild_regex(self):
         # Create a regular expression from all of the dictionary keys
-        regex = re.compile("|".join(map(re.escape, adict.keys())))
+        self.regex = re.compile("|".join(map(re.escape, self.path_mapping)))
 
-        # For each match, look up the corresponding value in the dictionary
-        return regex.sub(lambda match: adict[match.group(0)], text)
+    async def dispatch(self, payload):
+        logger.debug("%s:\n%s", self.direction.upper(), pformat(payload))
 
+        for obj, prop, path in self.find_path_properties(payload):
+            new_path = self.multiple_replace(path)
 
-class SmartDispatcher(BaseDispatcher):
-    """
-    WIP
+            if not os.path.exists(new_path) and self.remote_accessor:
+                new_path = self.remote_accessor.download(path)
 
-    Knows how to handle concrete methods.
-    Can download unknown files from the remote host.
-    """
-
-    def __init__(self, path_mapping):
-        super().__init__(path_mapping)
-
-        self._requests_in_progress = {}
-
-    async def dispatch(self, payload, direction):
-        message_type = self.get_message_type(payload)
-
-        if message_type == MessageTypes.ERROR:
-            logger.error(
-                "%s (%s)", payload["error"]["message"], payload["error"]["code"]
-            )
-            return payload
-
-        if message_type in MessageTypes.REQUEST:
-            method = payload["method"]
-            self._requests_in_progress[payload["id"]] = payload["method"]
-        elif message_type == MessageTypes.RESPONSE:
-            method = self._requests_in_progress[payload["id"]]
-            del self._requests_in_progress[payload["id"]]
-        elif message_type == MessageTypes.NOTIFICATION:
-            method = payload["method"]
-
-        handler_name = method.replace("/", "_") + "__" + message_type
-
-        handler = getattr(self, handler_name, None)
-
-        if handler is not None:
-            return handler(payload)
+            obj[prop] = new_path
 
         return payload
 
+    def find_path_properties(self, dict_or_list):
+        if isinstance(dict_or_list, dict):
+            iterator = dict_or_list.items()
+        else:
+            iterator = enumerate(dict_or_list)
+
+        for k, v in iterator:
+            if k in self.path_properties:
+                yield dict_or_list, k, v
+
+            if isinstance(v, (dict, list)):
+                yield from self.find_path_properties(v)
+
+    def multiple_replace(self, text):
+        # For each match, look up the corresponding value in the dictionary
+        return self.regex.sub(lambda m: self.path_mapping[m.group(0)], text)
+
 
 class LspProxyServer:
-    def __init__(self, dest_host, dest_port, listen_port, dispatcher, loop=None):
-        self.dispatcher = dispatcher
+    def __init__(
+        self,
+        target_host,
+        target_port,
+        listen_host,
+        listen_port,
+        upstream_dispatcher,
+        downstream_dispatcher,
+        loop=None,
+    ):
+        self.upstream_dispatcher = upstream_dispatcher
+        self.downstream_dispatcher = downstream_dispatcher
 
-        self.dest_host = dest_host
-        self.dest_port = dest_port
+        self.target_host = target_host
+        self.target_port = target_port
 
         self._loop = loop or asyncio.get_event_loop()
 
         self._server = asyncio.start_server(
-            self.handle_connection, host="0.0.0.0", port=listen_port
+            self.handle_connection, host=listen_host, port=listen_port
         )
 
     def start(self, and_loop=True):
         self._server = self._loop.run_until_complete(self._server)
         sockname = self._server.sockets[0].getsockname()
-        logger.info("Listening established on {0}".format(sockname))
+        logger.info("Listening established on %s", sockname)
 
         if and_loop:
             self._loop.run_forever()
@@ -137,51 +133,27 @@ class LspProxyServer:
     async def handle_connection(self, local_reader, local_writer):
         peername = local_writer.get_extra_info("peername")
 
-        logger.info("Accepted connection from {}".format(peername))
+        logger.info("Accepted connection from %s", peername)
 
-        try:
-            remote_reader, remote_writer = await asyncio.open_connection(
-                host=self.dest_host, port=self.dest_port
-            )
+        remote_reader, remote_writer = await asyncio.open_connection(
+            host=self.target_host, port=self.target_port
+        )
 
-            await asyncio.gather(
-                self.upstream(local_reader, remote_writer),
-                self.downstream(remote_reader, local_writer),
-            )
-        finally:
-            local_writer.close()
+        await asyncio.gather(
+            self.stream(local_reader, remote_writer, self.upstream_dispatcher),
+            self.stream(remote_reader, local_writer, self.downstream_dispatcher),
+        )
 
-    async def upstream(self, local_reader, remote_writer):
-        try:
-            while not local_reader.at_eof():
-                payload = await self.read_message(local_reader)
+    async def stream(self, reader, writer, dispatcher):
+        while not reader.at_eof():
+            payload = await self.read_message(reader)
 
-                if not payload:
-                    break
+            if not payload:
+                break
 
-                payload = await self.dispatcher.dispatch(payload, Direction.UPSTREAM)
+            payload = await dispatcher.dispatch(payload)
 
-                logger.debug("UPSTREAM:\n%s", pformat(payload))
-
-                await self.send_message(payload, remote_writer)
-        finally:
-            remote_writer.close()
-
-    async def downstream(self, remote_reader, local_writer):
-        try:
-            while not remote_reader.at_eof():
-                payload = await self.read_message(remote_reader)
-
-                if not payload:
-                    break
-
-                payload = await self.dispatcher.dispatch(payload, Direction.DOWNSTREAM)
-
-                logger.debug("DOWNSTREAM:\n%s", pformat(payload))
-
-                await self.send_message(payload, local_writer)
-        finally:
-            local_writer.close()
+            await self.send_message(payload, writer)
 
     async def read_message(self, reader):
         """
@@ -199,21 +171,23 @@ class LspProxyServer:
         }
         """
 
-        data = await reader.readline()
+        headers = {}
 
-        if not data:
-            return None
+        while True:
+            data = await reader.readline()
 
-        content_length_header = data.decode().rstrip()
-        content_length = int(content_length_header[16:])
+            if not data:
+                return None
 
-        # read optional content type header
-        content_type_header = await reader.readline()
-        content_type = content_type_header.decode().rstrip()
+            if data == b"\r\n":
+                break
 
-        if content_type:
-            await reader.readline()  # read empty line
+            name, _, value = data.decode().partition(":")
+            headers[name.strip()] = value.strip()
 
+        logger.debug(headers)
+
+        content_length = int(headers["Content-Length"])
         body = await reader.read(content_length)
         return json.loads(body)
 
@@ -224,43 +198,65 @@ class LspProxyServer:
         writer.write(response.encode("utf-8"))
 
 
-if __name__ == "__main__":
+def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Proxy for Language Server running inside docker container"
     )
+
     parser.add_argument("--path-mapping", "-m", action="append")
     parser.add_argument("--target", "-t", required=True)
+    parser.add_argument("--host", "-H", default="127.0.0.1")
     parser.add_argument("--port", "-p", type=int, required=True)
-
     parser.add_argument("--verbose", "-v", action="count", default=0)
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    logging_level = {
-        0: logging.NOTSET,
-        1: logging.ERROR,
-        2: logging.INFO,
-        3: logging.DEBUG,
-    }
 
-    logger.setLevel(logging_level[args.verbose])
+def setup_logging(args):
+    if args.verbose == 0:
+        level = logging.NOTSET
+    elif args.verbose == 1:
+        level = logging.WARNING
+    elif args.verbose == 2:
+        level = logging.INFO
+    else:
+        level = logging.DEBUG
+
+    logger.setLevel(level)
     logger.addHandler(logging.StreamHandler())
 
-    path_mapping = dict([mapping.split(":") for mapping in args.path_mapping])
 
-    logger.debug("Path mapping: %s", pformat(path_mapping))
+def parse_path_mapping(args):
+    upstream = dict([mapping.split(":") for mapping in args.path_mapping])
+    downstream = {v: k for k, v in upstream.items()}
+    return upstream, downstream
 
-    dispatcher = NaiveDispatcher(path_mapping=path_mapping)
 
+def parse_target(args):
     dest_host, _, dest_port = args.target.rpartition(":")
+    return dest_host, int(dest_port)
+
+
+def main():
+    args = parse_args()
+    setup_logging(args)
+
+    target_host, target_port = parse_target(args)
+    upstream_mapping, downstream_mapping = parse_path_mapping(args)
 
     proxy = LspProxyServer(
-        dest_host=dest_host,
-        dest_port=int(dest_port),
+        target_host=target_host,
+        target_port=target_port,
+        listen_host=args.host,
         listen_port=args.port,
-        dispatcher=dispatcher,
+        upstream_dispatcher=Dispatcher(
+            path_mapping=upstream_mapping, direction=Direction.UPSTREAM
+        ),
+        downstream_dispatcher=Dispatcher(
+            path_mapping=downstream_mapping, direction=Direction.DOWNSTREAM
+        ),
     )
 
     try:
@@ -269,3 +265,7 @@ if __name__ == "__main__":
         pass
     finally:
         proxy.stop()
+
+
+if __name__ == "__main__":
+    main()
